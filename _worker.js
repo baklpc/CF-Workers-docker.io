@@ -1,4 +1,4 @@
-// _worker.js - Docker Registry Proxy with Authentication
+// _worker.js - Docker Registry Proxy with Authentication (修复版)
 
 // Docker镜像仓库主机地址
 let hub_host = 'registry-1.docker.io';
@@ -223,11 +223,17 @@ async function searchInterface() {
     `;
 }
 
-// 获取 Docker Token 并缓存
+// 获取 Docker Token 并缓存 - 修复：正确处理 library/ 前缀
 async function getDockerToken(repo, scope = 'pull') {
     if (!repo) return null;
     
-    const cacheKey = `${repo}:${scope}`;
+    // 对于 Docker Hub，如果 repo 不包含 / 且不是以 library/ 开头，添加 library/ 前缀
+    let normalizedRepo = repo;
+    if (hub_host === 'registry-1.docker.io' && !repo.includes('/') && !repo.startsWith('library/')) {
+        normalizedRepo = `library/${repo}`;
+    }
+    
+    const cacheKey = `${normalizedRepo}:${scope}`;
     if (tokenCache.has(cacheKey)) {
         const cached = tokenCache.get(cacheKey);
         if (Date.now() - cached.timestamp < 300000) { // 5分钟缓存
@@ -237,7 +243,9 @@ async function getDockerToken(repo, scope = 'pull') {
     }
     
     try {
-        const tokenUrl = `${auth_url}/token?service=registry.docker.io&scope=repository:${repo}:${scope}`;
+        const tokenUrl = `${auth_url}/token?service=registry.docker.io&scope=repository:${normalizedRepo}:${scope}`;
+        console.log(`Getting token for: ${normalizedRepo}, URL: ${tokenUrl}`);
+        
         const tokenRes = await fetch(tokenUrl, {
             headers: {
                 'User-Agent': 'Mozilla/5.0 (compatible; Docker-Client)',
@@ -247,6 +255,8 @@ async function getDockerToken(repo, scope = 'pull') {
         
         if (!tokenRes.ok) {
             console.error(`Token request failed: ${tokenRes.status}`);
+            const errorText = await tokenRes.text();
+            console.error(`Token error: ${errorText}`);
             return null;
         }
         
@@ -302,9 +312,6 @@ export default {
         const fakePage = checkHost ? checkHost[1] : false;
         console.log(`域名头部: ${hostTop} 反代地址: ${hub_host} searchInterface: ${fakePage}`);
         
-        url.hostname = hub_host;
-        const hubParams = ['/v1/search', '/v1/repositories'];
-        
         // 屏蔽爬虫
         if (屏蔽爬虫UA.some(fxxk => userAgent.includes(fxxk)) && 屏蔽爬虫UA.length > 0) {
             return new Response(await nginx(), {
@@ -313,6 +320,7 @@ export default {
         }
         
         // 处理浏览器访问和搜索
+        const hubParams = ['/v1/search', '/v1/repositories'];
         if ((userAgent && userAgent.includes('mozilla')) || hubParams.some(param => url.pathname.includes(param))) {
             if (url.pathname == '/') {
                 if (env.URL302) {
@@ -367,7 +375,7 @@ export default {
             console.log(`handle_url: ${url}`);
         }
 
-        // ========== 核心修改：处理需要认证的 Docker Registry V2 请求 ==========
+        // ========== 核心：处理需要认证的 Docker Registry V2 请求 ==========
         if (url.pathname.startsWith('/v2/')) {
             // 提取镜像仓库名
             let repo = '';
@@ -376,19 +384,18 @@ export default {
                 repo = v2Match[1];
             }
 
-            // 判断是否需要认证 (manifests, blobs, tags 都需要)
+            // 判断是否需要认证
             const needsAuth = url.pathname.includes('/manifests/') || 
                               url.pathname.includes('/blobs/') || 
                               url.pathname.includes('/tags/') || 
                               url.pathname.endsWith('/tags/list') ||
                               url.pathname.includes('/_catalog');
 
-            // 如果需要认证且有 repo
             if (needsAuth && repo) {
-                // 获取 Token
+                // 获取 Token - 使用 normalizeRepo 处理
                 const token = await getDockerToken(repo, 'pull');
                 
-                // 构建请求参数，强制添加 Authorization 头
+                // 构建请求参数
                 let parameter = {
                     headers: {
                         'Host': hub_host,
@@ -402,12 +409,15 @@ export default {
                     cacheTtl: 3600
                 };
 
-                // 如果获取到 Token，添加 Authorization 头
+                // 关键：添加 Authorization 头
                 if (token) {
                     parameter.headers['Authorization'] = `Bearer ${token}`;
+                    console.log(`Using token for ${repo}`);
+                } else {
+                    console.warn(`No token available for ${repo}`);
                 }
 
-                // 复制原始请求中可能存在的其他头部
+                // 复制其他头部
                 if (request.headers.has("Content-Type")) {
                     parameter.headers["Content-Type"] = getReqHeader("Content-Type");
                 }
@@ -415,18 +425,36 @@ export default {
                     parameter.headers['X-Amz-Content-Sha256'] = getReqHeader("X-Amz-Content-Sha256");
                 }
 
-                // 如果有请求体（如 PUT/POST），传递 body
+                // 传递请求体
                 if (request.method === 'PUT' || request.method === 'POST' || request.method === 'PATCH') {
                     parameter.body = request.body;
                 }
 
                 try {
-                    // 发起认证请求
-                    let original_response = await fetch(new Request(url, request), parameter);
-                    let original_response_clone = original_response.clone();
+                    // 构建目标 URL - 注意保留原始 pathname
+                    const targetUrl = new URL(url.pathname + url.search, `https://${hub_host}`);
+                    console.log(`Fetching: ${targetUrl.href}`);
+                    
+                    let original_response = await fetch(targetUrl.href, parameter);
                     let response_headers = original_response.headers;
                     let new_response_headers = new Headers(response_headers);
                     let status = original_response.status;
+
+                    // 如果返回 401 或 403，可能是 token 问题，尝试重新获取
+                    if ((status === 401 || status === 403) && token) {
+                        console.log(`Auth failed with status ${status}, clearing cache and retrying...`);
+                        // 清除缓存重试
+                        const normalizedRepo = repo.includes('/') ? repo : `library/${repo}`;
+                        tokenCache.delete(`${normalizedRepo}:pull`);
+                        const newToken = await getDockerToken(repo, 'pull');
+                        if (newToken) {
+                            parameter.headers['Authorization'] = `Bearer ${newToken}`;
+                            original_response = await fetch(targetUrl.href, parameter);
+                            response_headers = original_response.headers;
+                            new_response_headers = new Headers(response_headers);
+                            status = original_response.status;
+                        }
+                    }
 
                     // 修改 Www-Authenticate 头
                     if (new_response_headers.get("Www-Authenticate")) {
@@ -435,22 +463,20 @@ export default {
                     }
 
                     // 处理重定向
-                    if (new_response_headers.get("Location") && status === 307) {
+                    if (new_response_headers.get("Location") && (status === 307 || status === 302)) {
                         const location = new_response_headers.get("Location");
                         console.info(`Redirecting to ${location}`);
-                        // 处理重定向，使用相同认证
                         try {
-                            const redirectUrl = new URL(location);
-                            if (!redirectUrl.hostname) {
-                                const fullUrl = new URL(location, `https://${hub_host}`);
-                                const redirectRes = await fetch(fullUrl, parameter);
-                                return redirectRes;
-                            }
                             const redirectRes = await fetch(location, parameter);
                             return redirectRes;
                         } catch (err) {
                             console.error('Redirect failed:', err);
                         }
+                    }
+
+                    // 检查响应状态，如果是 404，可能镜像不存在
+                    if (status === 404) {
+                        console.warn(`Image ${repo} not found (404)`);
                     }
 
                     // 返回响应
@@ -471,7 +497,7 @@ export default {
             }
         }
 
-        // ========== 处理不需要认证或非 /v2/ 的请求 ==========
+        // ========== 处理不需要认证的请求 ==========
         // 修改 /v2/ 请求路径 (library 补全逻辑)
         if (hub_host == 'registry-1.docker.io' && /^\/v2\/[^/]+\/[^/]+\/[^/]+$/.test(url.pathname) && !/^\/v2\/library/.test(url.pathname)) {
             url.pathname = '/v2/library/' + url.pathname.split('/v2/')[1];
@@ -500,7 +526,6 @@ export default {
         }
 
         let original_response = await fetch(new Request(url, request), parameter);
-        let original_response_clone = original_response.clone();
         let response_headers = original_response.headers;
         let new_response_headers = new Headers(response_headers);
         let status = original_response.status;
@@ -516,11 +541,10 @@ export default {
             return httpHandler(request, location, hub_host);
         }
 
-        let response = new Response(original_response.body, {
+        return new Response(original_response.body, {
             status,
             headers: new_response_headers
         });
-        return response;
     }
 };
 
